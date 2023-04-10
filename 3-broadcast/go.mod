@@ -4,6 +4,8 @@ go 1.20
 
 require github.com/jepsen-io/maelstrom/demo/go v0.0.0-20230321201811-151ad3cff117
 
+require golang.org/x/sync v0.1.0 // indirect
+
 require (
 	github.com/samber/lo v1.38.1
 	github.com/tidwall/gjson v1.14.4
