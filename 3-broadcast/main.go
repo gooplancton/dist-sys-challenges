@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -17,10 +16,22 @@ func BroadcastValue(n *maelstrom.Node, neighbourId string, value int64, skipIds 
 	broadcastBody := make(map[string]interface{})
 	broadcastBody["type"] = "broadcast"
 	broadcastBody["message"] = value
-	msgReply, err := n.SyncRPC(context.Background(), neighbourId, broadcastBody)
-	msgReplyType := gjson.GetBytes(msgReply.Body, "type").Str
+	replyChan := make(chan *maelstrom.Message, 1)
+	n.RPC(neighbourId, broadcastBody, func(msg maelstrom.Message) error {
+		replyChan <- &msg
+		close(replyChan)
 
-	return msgReplyType == "broadcast_ok" && err == nil
+		return nil
+	})
+
+	select {
+	case reply := <-replyChan:
+		msgReplyType := gjson.GetBytes(reply.Body, "type").Str
+		return msgReplyType == "broadcast_ok"
+
+	case <- time.After(1*time.Second/2):
+		return false	
+	}
 }
 
 type ResendJob struct {
@@ -33,17 +44,6 @@ func main() {
 	n := maelstrom.NewNode()
 	values := []int64{}
 	neighbours := []string{}
-	resendChan := make(chan *ResendJob, 1)
-
-	go func() {
-		for resendJob := range resendChan {
-			ok := BroadcastValue(n, resendJob.NeighbourId, resendJob.Value, resendJob.SkipIds)
-			if !ok {
-				time.Sleep(1)
-				resendChan <- resendJob
-			}
-		}
-	}()
 
 	n.Handle("topology", func(msg maelstrom.Message) error {
 		var msgBody map[string]interface{}
@@ -76,9 +76,10 @@ func main() {
 					continue
 				}
 
-				ok := BroadcastValue(n, neighbourId, value, append(skipIds, n.ID()))
-				if !ok {
-					resendChan <- &ResendJob{NeighbourId: neighbourId, Value: value, SkipIds: skipIds}
+				skipIds = append(skipIds, n.ID())
+				ok := BroadcastValue(n, neighbourId, value, skipIds)
+				for !ok {
+					ok = BroadcastValue(n, neighbourId, value, skipIds)
 				}
 			}
 		}
