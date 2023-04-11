@@ -2,109 +2,107 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
-	"time"
+	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
-	"github.com/samber/lo"
-	"github.com/tidwall/gjson"
 	"golang.org/x/exp/slices"
 )
 
-func BroadcastValue(n *maelstrom.Node, neighbourId string, value int64, skipIds []string) bool {
-	broadcastBody := make(map[string]interface{})
-	broadcastBody["type"] = "broadcast"
-	broadcastBody["message"] = value
-	replyChan := make(chan *maelstrom.Message, 1)
-	n.RPC(neighbourId, broadcastBody, func(msg maelstrom.Message) error {
-		replyChan <- &msg
-		close(replyChan)
-
-		return nil
-	})
-
-	select {
-	case reply := <-replyChan:
-		msgReplyType := gjson.GetBytes(reply.Body, "type").Str
-		return msgReplyType == "broadcast_ok"
-
-	case <- time.After(1*time.Second/2):
-		return false	
-	}
+type BroadcastJob struct {
+  Destination string
+  Value int64
+  SkipIds []string
 }
 
-type ResendJob struct {
-	NeighbourId string
-	Value       int64
-	SkipIds     []string
+type TopologyMsgBody struct {
+  Topology map[string][]string `json:"topology"`
+}
+
+type BroadcastMsgBody struct {
+  Message int64 `json:"message"`
+  SkipIds []string `json:"skip_ids,omitempty"` 
+}
+
+func broadcaster(n *maelstrom.Node, jobs chan *BroadcastJob){
+  for broadcastJob := range jobs {
+    msgBody := make(map[string]interface{})
+    msgBody["type"] = "broadcast"
+    msgBody["message"] = broadcastJob.Value
+    msgBody["skip_ids"] = broadcastJob.SkipIds
+
+    n.Send(broadcastJob.Destination, msgBody)
+  }
 }
 
 func main() {
-	n := maelstrom.NewNode()
-	values := []int64{}
-	neighbours := []string{}
+  n := maelstrom.NewNode()
+  neighbors := []string{}
+  messagesMutex := sync.RWMutex{}
+  messages := []int64{}
+  jobs := make(chan *BroadcastJob, 10)
 
-	n.Handle("topology", func(msg maelstrom.Message) error {
-		var msgBody map[string]interface{}
-		json.Unmarshal(msg.Body, &msgBody)
-		topologyPath := fmt.Sprintf("topology.%s", n.ID())
-		_neighbours := gjson.GetBytes(msg.Body, topologyPath).Array()
-		neighbours = lo.Map(_neighbours, func(res gjson.Result, _ int) string {
-			return res.Str
-		})
-		msgBody["type"] = "topology_ok"
-		delete(msgBody, "topology")
+  for w := 0; w < 10; w++ {
+    go broadcaster(n, jobs)
+  }
 
-		return n.Reply(msg, msgBody)
-	})
+  n.Handle("topology", func(msg maelstrom.Message) error {
+    var topologyMsgBody TopologyMsgBody
+    if err := json.Unmarshal(msg.Body, &topologyMsgBody); err != nil {
+      return err
+    }
 
-	n.Handle("broadcast", func(msg maelstrom.Message) error {
-		var msgBody map[string]interface{}
-		json.Unmarshal(msg.Body, &msgBody)
-		value := gjson.GetBytes(msg.Body, "message").Int()
-		_skipIds := gjson.GetBytes(msg.Body, "skip_ids").Array()
-		var skipIds []string = lo.Map(_skipIds, func(r gjson.Result, _ int) string {
-			return r.Str
-		})
+    neighbors = topologyMsgBody.Topology[n.ID()]
+    res := make(map[string]interface{})
+    res["type"] = "topology_ok"
+    return n.Reply(msg, res) 
+  })
 
-		if !slices.Contains(values, value) {
-			values = append(values, value)
+  n.Handle("read", func(msg maelstrom.Message) error {
+    messagesMutex.RLock()
+    res := make(map[string]interface{})
+    res["type"] = "read_ok"
+    res["messages"] = messages
+    err := n.Reply(msg, res)
 
-			for _, neighbourId := range neighbours {
-				if slices.Contains(skipIds, neighbourId) {
-					continue
-				}
+    messagesMutex.RUnlock()
+    return err
+  })
 
-				skipIds = append(skipIds, n.ID())
-				ok := BroadcastValue(n, neighbourId, value, skipIds)
-				for !ok {
-					ok = BroadcastValue(n, neighbourId, value, skipIds)
-				}
-			}
-		}
+  n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
+    return nil
+  })
 
-		delete(msgBody, "message")
-		msgBody["type"] = "broadcast_ok"
+  n.Handle("broadcast", func(msg maelstrom.Message) error {
+    var broadcastMsgBody BroadcastMsgBody
+    if err := json.Unmarshal(msg.Body, &broadcastMsgBody); err != nil {
+      return err
+    }
 
-		return n.Reply(msg, msgBody)
-	})
+    messagesMutex.Lock()
+    if !slices.Contains(messages, broadcastMsgBody.Message) {
+      messages = append(messages, broadcastMsgBody.Message)
+    }
+    messagesMutex.Unlock()
 
-	n.Handle("read", func(msg maelstrom.Message) error {
-		var msgBody map[string]interface{}
-		json.Unmarshal(msg.Body, &msgBody)
+    skipIds := append(broadcastMsgBody.SkipIds, n.ID())
+    for _, neighbor := range neighbors {
+      if !slices.Contains(skipIds, neighbor) {
+        jobs <- &BroadcastJob{
+          Value: broadcastMsgBody.Message,
+          Destination: neighbor,
+          SkipIds: skipIds,
+        }
+      }
+    }
 
-		msgBody["type"] = "read_ok"
-		msgBody["messages"] = values
+    res := make(map[string]interface{})
+    res["type"] = "broadcast_ok"
+    return n.Reply(msg, res)
+  })
 
-		return n.Reply(msg, msgBody)
-	})
-
-	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
-		return nil
-	})
-
-	if err := n.Run(); err != nil {
-		log.Fatal(err)
-	}
+  if err := n.Run(); err != nil {
+    log.Fatal(err)
+  } 
 }
+
