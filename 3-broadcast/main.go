@@ -12,7 +12,6 @@ import (
 type BroadcastJob struct {
   Destination string
   Value int64
-  SkipIds []string
 }
 
 type TopologyMsgBody struct {
@@ -21,7 +20,6 @@ type TopologyMsgBody struct {
 
 type BroadcastMsgBody struct {
   Message int64 `json:"message"`
-  SkipIds []string `json:"skip_ids,omitempty"` 
 }
 
 func broadcaster(n *maelstrom.Node, jobs chan *BroadcastJob){
@@ -29,9 +27,17 @@ func broadcaster(n *maelstrom.Node, jobs chan *BroadcastJob){
     msgBody := make(map[string]interface{})
     msgBody["type"] = "broadcast"
     msgBody["message"] = broadcastJob.Value
-    msgBody["skip_ids"] = broadcastJob.SkipIds
 
-    n.Send(broadcastJob.Destination, msgBody)
+    n.RPC(broadcastJob.Destination, msgBody, func(res maelstrom.Message) error {
+
+      var resBody map[string]interface{}
+      err := json.Unmarshal(res.Body, &resBody)
+      if err != nil || resBody["type"] != "broadcast_ok" {
+        jobs <- broadcastJob
+      }
+      
+      return nil
+    })
   }
 }
 
@@ -79,25 +85,24 @@ func main() {
       return err
     }
 
+    res := make(map[string]interface{})
+    res["type"] = "broadcast_ok"
+
     messagesMutex.Lock()
-    if !slices.Contains(messages, broadcastMsgBody.Message) {
-      messages = append(messages, broadcastMsgBody.Message)
+    if slices.Contains(messages, broadcastMsgBody.Message) {
+      messagesMutex.Unlock()
+      return n.Reply(msg, res)
     }
+    messages = append(messages, broadcastMsgBody.Message)
     messagesMutex.Unlock()
 
-    skipIds := append(broadcastMsgBody.SkipIds, n.ID())
     for _, neighbor := range neighbors {
-      if !slices.Contains(skipIds, neighbor) {
-        jobs <- &BroadcastJob{
-          Value: broadcastMsgBody.Message,
-          Destination: neighbor,
-          SkipIds: skipIds,
-        }
+      jobs <- &BroadcastJob{
+        Value: broadcastMsgBody.Message,
+        Destination: neighbor,
       }
     }
 
-    res := make(map[string]interface{})
-    res["type"] = "broadcast_ok"
     return n.Reply(msg, res)
   })
 
