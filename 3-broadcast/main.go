@@ -2,8 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
+	"os"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 	"golang.org/x/exp/slices"
@@ -24,6 +27,7 @@ type BroadcastMsgBody struct {
 
 func broadcaster(n *maelstrom.Node, jobs chan *BroadcastJob){
   for broadcastJob := range jobs {
+    waitAckChan := make(chan bool)
     msgBody := make(map[string]interface{})
     msgBody["type"] = "broadcast"
     msgBody["message"] = broadcastJob.Value
@@ -32,12 +36,22 @@ func broadcaster(n *maelstrom.Node, jobs chan *BroadcastJob){
 
       var resBody map[string]interface{}
       err := json.Unmarshal(res.Body, &resBody)
-      if err != nil || resBody["type"] != "broadcast_ok" {
-        jobs <- broadcastJob
-      }
+      ok := err == nil && resBody["type"] == "broadcast_ok"
+      waitAckChan <- ok
+      close(waitAckChan)
       
       return nil
     })
+
+    select {
+    case ok := <- waitAckChan:
+      if !ok {
+        jobs <- broadcastJob
+      }
+    case <- time.After(50*time.Millisecond):
+      fmt.Fprintln(os.Stderr, "resending value")
+      jobs <- broadcastJob
+    }
   }
 }
 
@@ -46,7 +60,7 @@ func main() {
   neighbors := []string{}
   messagesMutex := sync.RWMutex{}
   messages := []int64{}
-  jobs := make(chan *BroadcastJob, 10)
+  jobs := make(chan *BroadcastJob, 100)
 
   for w := 0; w < 10; w++ {
     go broadcaster(n, jobs)
